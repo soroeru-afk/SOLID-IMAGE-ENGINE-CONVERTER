@@ -1,8 +1,8 @@
-const CACHE_NAME = 'solid-image-engine-v1.1';
+const CACHE_NAME = 'solid-image-engine-v1.2';
 const urlsToCache = [
-  '/',
-  '/index.html',
-  '/manifest.json'
+  './',
+  './index.html',
+  './manifest.json'
 ];
 
 self.addEventListener('install', event => {
