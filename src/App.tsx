@@ -1046,8 +1046,14 @@ export default function App() {
   const [autoRemoveSpaces, setAutoRemoveSpaces] = useState(true);
   const [activeTab, setActiveTab] = useState<'convert' | 'rename' | 'text_scan' | 'metadata'>('convert');
   const [globalMessage, setGlobalMessage] = useState<{type: 'error' | 'info', text: string} | null>(null);
-  const [sidebarPosition, setSidebarPosition] = useState<'right' | 'left'>('right');
-  const [sidebarWidth, setSidebarWidth] = useState(320);
+  const [sidebarPosition, setSidebarPosition] = useState<'right' | 'left'>(() => {
+    return (localStorage.getItem('sidebarPosition') as 'right' | 'left') || 'right';
+  });
+  const [sidebarWidth, setSidebarWidth] = useState(() => {
+    const saved = localStorage.getItem('sidebarWidth');
+    const val = parseInt(saved || '320', 10);
+    return isNaN(val) ? 320 : val;
+  });
   const [isResizing, setIsResizing] = useState(false);
   const dragRef = useRef<{ startX: number, startWidth: number } | null>(null);
   const [inspectModalItem, setInspectModalItem] = useState<FileItem | null>(null);
@@ -1134,6 +1140,14 @@ export default function App() {
   }, [isResizing, sidebarPosition]);
 
   useEffect(() => {
+    localStorage.setItem('sidebarPosition', sidebarPosition);
+  }, [sidebarPosition]);
+
+  useEffect(() => {
+    localStorage.setItem('sidebarWidth', sidebarWidth.toString());
+  }, [sidebarWidth]);
+
+  useEffect(() => {
     const t = THEMES[activeTheme as keyof typeof THEMES];
     if (t) {
       document.documentElement.style.setProperty("--theme-accent", t.accent);
@@ -1190,7 +1204,27 @@ export default function App() {
                     canvas.width = viewport.width;
                     canvas.height = viewport.height;
                     
-                    await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+                    const renderContext = {
+                      canvasContext: ctx,
+                      viewport: viewport,
+                      canvasFactory: {
+                        create: (w: number, h: number) => {
+                          const c = document.createElement('canvas');
+                          c.width = w;
+                          c.height = h;
+                          return { canvas: c, context: c.getContext('2d') };
+                        },
+                        reset: (c: any, w: number, h: number) => {
+                          c.canvas.width = w;
+                          c.canvas.height = h;
+                        },
+                        destroy: (c: any) => {
+                          c.canvas.width = 0;
+                          c.canvas.height = 0;
+                        }
+                      }
+                    } as any;
+                    await page.render(renderContext).promise;
                     
                     const blob = await new Promise<Blob | null>(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
                     if (blob) {
@@ -1692,7 +1726,7 @@ export default function App() {
                try {
                   const worker = await Tesseract.createWorker(ocrLang);
                   await worker.setParameters({
-                    tessedit_pageseg_mode: ocrLang === 'jpn_vert' ? '5' : '3',
+                    tessedit_pageseg_mode: (ocrLang === 'jpn_vert' ? Tesseract.PSM.SINGLE_BLOCK_VERT_TEXT : Tesseract.PSM.AUTO),
                   });
                   const { data: { text } } = await worker.recognize(optimizedCanvas);
                   await worker.terminate();
