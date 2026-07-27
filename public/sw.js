@@ -1,4 +1,4 @@
-const CACHE_NAME = 'solid-image-engine-v1.2';
+const CACHE_NAME = 'solid-image-engine-v2';
 const urlsToCache = [
   './',
   './index.html',

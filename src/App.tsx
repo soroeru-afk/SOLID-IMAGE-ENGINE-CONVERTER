@@ -6,8 +6,9 @@ import heic2any from 'heic2any';
 import Tesseract from 'tesseract.js';
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.mjs?url';
-import { UploadCloud, Download, Image as ImageIcon, Trash2, Settings, Monitor, Layers, Play, CheckCircle2, Copy, RotateCcw, ChevronLeft, ChevronRight, PanelLeft, PanelRight } from 'lucide-react';
+import { UploadCloud, Download, Image as ImageIcon, Trash2, Settings, Monitor, Layers, Play, CheckCircle2, Copy, RotateCcw, ChevronLeft, ChevronRight, PanelLeft, PanelRight, FileJson } from 'lucide-react';
 import * as piexif from 'piexifjs';
+import { GoogleGenAI } from '@google/genai';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
 
@@ -1021,6 +1022,290 @@ const DenoisePreviewModal = ({
   );
 };
 
+async function extractSDMetadata(file: File): Promise<string | null> {
+  const buffer = await file.arrayBuffer();
+  const view = new DataView(buffer);
+  
+  // 1. Precise PNG chunk extraction
+  if (file.type === 'image/png' || new Uint8Array(buffer, 0, 8).join(',') === '137,80,78,71,13,10,26,10') {
+    let offset = 8;
+    while (offset < view.byteLength) {
+      if (offset + 8 > view.byteLength) break;
+      const length = view.getUint32(offset);
+      const type = String.fromCharCode(
+        view.getUint8(offset + 4),
+        view.getUint8(offset + 5),
+        view.getUint8(offset + 6),
+        view.getUint8(offset + 7)
+      );
+      
+      if (type === 'tEXt') {
+        const chunkData = new Uint8Array(buffer, offset + 8, length);
+        const text = new TextDecoder('utf-8').decode(chunkData);
+        if (text.startsWith('parameters\0')) {
+          return text.substring(11);
+        }
+      } else if (type === 'iTXt') {
+        const chunkData = new Uint8Array(buffer, offset + 8, length);
+        const textDecoded = new TextDecoder('iso-8859-1').decode(chunkData);
+        if (textDecoded.startsWith('parameters\0')) {
+          let idx = 13;
+          while (idx < chunkData.length && chunkData[idx] !== 0) idx++; // lang tag
+          idx++;
+          while (idx < chunkData.length && chunkData[idx] !== 0) idx++; // trans key
+          idx++;
+          return new TextDecoder('utf-8').decode(chunkData.slice(idx));
+        }
+      }
+      offset += 12 + length;
+    }
+  }
+
+  // 2. Fallback brute-force text search (handles WebP/JPEG EXIF and unknown formats)
+  const text = new TextDecoder('iso-8859-1').decode(buffer);
+  
+  const stepsMatch = text.match(/Steps: \d+, .*?Seed: \d+/);
+  if (stepsMatch) {
+    const beforeSteps = text.substring(0, stepsMatch.index);
+    let lastBinary = -1;
+    for (let i = beforeSteps.length - 1; i >= 0; i--) {
+      const code = beforeSteps.charCodeAt(i);
+      if (code < 32 && code !== 10 && code !== 13) {
+        lastBinary = i;
+        break;
+      }
+    }
+    const promptPart = beforeSteps.substring(lastBinary + 1);
+    
+    const afterSteps = text.substring(stepsMatch.index!);
+    let endBinary = afterSteps.search(/[\x00-\x09\x0B-\x1F]/);
+    const settingsPart = endBinary !== -1 ? afterSteps.substring(0, endBinary) : afterSteps;
+    
+    const extractStr = promptPart + settingsPart;
+    const extractBytes = new Uint8Array(extractStr.length);
+    for (let i = 0; i < extractStr.length; i++) extractBytes[i] = extractStr.charCodeAt(i);
+    return new TextDecoder('utf-8').decode(extractBytes).trim();
+  }
+
+  return null;
+}
+
+function parseSDText(raw: string) {
+  let prompt = '';
+  let negative_prompt = '';
+  let settingsText = '';
+
+  let text = raw.trim();
+  text = text.replace(/^UNICODE\0?/i, '').trim();
+  // "\n" のようなエスケープされた改行を実際の改行文字に変換
+  text = text.replace(/\\n/g, '\n');
+
+  const stepsMatch = text.match(/(?:^|\n)(Steps: \d+, .*)$/is);
+  if (stepsMatch) {
+    settingsText = stepsMatch[1].trim();
+    const promptSection = text.substring(0, stepsMatch.index).trim();
+    
+    const negMatch = promptSection.match(/(?:^|\n)Negative prompt:\s*([\s\S]*)$/i);
+    if (negMatch) {
+      prompt = promptSection.substring(0, negMatch.index).trim();
+      negative_prompt = negMatch[1].trim();
+    } else {
+      prompt = promptSection;
+    }
+  } else {
+    prompt = text;
+  }
+
+  const cleanStr = (s: string) => {
+    let cl = s.trim();
+    // 制御文字を完全に削除
+    cl = cl.replace(/[\x00-\x1F\x7F]+/g, '');
+    // 先頭の空白、全角スペース、カンマ、ダブルクォート、シングルクォート、バックスラッシュなどを削除
+    cl = cl.replace(/^[\s\u3000,"'\\]+/, '');
+    // 末尾の空白、全角スペース、カンマ、ダブルクォート、シングルクォート、バックスラッシュなどを削除
+    cl = cl.replace(/[\s\u3000,"'\\]+$/, '');
+    return cl.trim();
+  };
+
+  prompt = cleanStr(prompt);
+  negative_prompt = cleanStr(negative_prompt);
+
+  const settings: Record<string, string> = {};
+  if (settingsText) {
+    const parts = settingsText.split(', ');
+    for (const part of parts) {
+      const splitIndex = part.indexOf(': ');
+      if (splitIndex !== -1) {
+        const key = part.substring(0, splitIndex).trim().toLowerCase().replace(/ /g, '_');
+        let val = part.substring(splitIndex + 2).trim();
+        // valからも末尾のゴミや制御文字以降を削除
+        val = val.replace(/[\x00-\x1F\x7F].*$/, '');
+        val = val.replace(/[\s\u3000,"'\\]+$/, '');
+        settings[key] = val;
+      }
+    }
+  }
+
+  return { prompt, negative_prompt, settings };
+}
+
+async function generatePromptFromImage(file: File) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("Gemini API key is not configured.");
+  const ai = new GoogleGenAI({ apiKey });
+
+  const buffer = await file.arrayBuffer();
+  const base64 = btoa(
+    new Uint8Array(buffer).reduce((data, byte) => data + String.fromCharCode(byte), '')
+  );
+
+  const response = await ai.models.generateContent({
+    model: 'gemini-2.5-flash',
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          { text: `Analyze this image and generate a Stable Diffusion prompt that would recreate it. 
+Output exactly in this JSON format:
+{
+  "prompt": "detailed positive prompt",
+  "negative_prompt": "things to avoid",
+  "settings": {
+    "steps": "20",
+    "sampler": "Euler a",
+    "cfg_scale": "7",
+    "seed": "-1"
+  }
+}` },
+          { inlineData: { mimeType: file.type || 'image/jpeg', data: base64 } }
+        ]
+      }
+    ]
+  });
+
+  const text = response.text || '';
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    return JSON.parse(jsonMatch[0]);
+  }
+  return { prompt: text, negative_prompt: '', settings: {} };
+}
+
+const PromptExtractorModal = ({ fileItem, onClose }: { fileItem: FileItem, onClose: () => void }) => {
+  const [result, setResult] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+    const processFile = async () => {
+      try {
+        const metaText = await extractSDMetadata(fileItem.file);
+        if (metaText) {
+          const parsed = parseSDText(metaText);
+          if (isMounted) {
+            setResult({ status: 'extracted', ...parsed });
+            setLoading(false);
+          }
+        } else {
+          const generated = await generatePromptFromImage(fileItem.file);
+          if (isMounted) {
+            setResult({ status: 'generated', ...generated });
+            setLoading(false);
+          }
+        }
+      } catch (err: any) {
+        if (isMounted) {
+          setError(err.message);
+          setLoading(false);
+        }
+      }
+    };
+    processFile();
+    return () => { isMounted = false; };
+  }, [fileItem]);
+
+  return (
+    <div className="fixed inset-0 z-[100] bg-[var(--bg-overlay-deep)] flex flex-col items-center justify-center p-4 lg:p-8 backdrop-blur-sm" onClick={onClose}>
+       <div className="bg-[var(--bg-panel)] border border-[var(--border-color)] rounded-sm p-4 w-full max-w-2xl max-h-[90vh] flex flex-col gap-4 shadow-2xl relative" onClick={e => e.stopPropagation()}>
+          <div className="flex justify-between items-center shrink-0">
+             <div className="flex flex-col">
+                <span className="text-[var(--theme-accent)] font-bold text-sm tracking-widest uppercase">PROMPT EXTRACTOR</span>
+                <span className="text-[var(--text-secondary)] text-[10px] tracking-wider">{fileItem.file.name}</span>
+             </div>
+             <button onClick={onClose} className="text-[var(--text-muted)] hover:text-[var(--text-primary)] p-2">✕</button>
+          </div>
+          
+          <div className="flex-1 overflow-y-auto bg-[var(--bg-deep)] border border-[var(--border-color)] p-4 rounded-sm custom-scrollbar min-h-[300px] relative">
+             {loading && (
+                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-4 bg-[var(--bg-deep)] z-10">
+                    <div className="w-6 h-6 border-2 border-transparent border-t-[var(--theme-accent)] rounded-full animate-spin"></div>
+                    <span className="text-[10px] text-[var(--theme-accent)] tracking-widest animate-pulse">ANALYZING IMAGE DATA...</span>
+                 </div>
+             )}
+             {error && (
+                 <div className="text-[#FF3B30] text-xs">
+                    Error: {error}
+                 </div>
+             )}
+             {result && (
+                 <div className="flex flex-col h-full gap-4">
+                     <div className="flex justify-between items-center">
+                         <span className={`px-2 py-0.5 rounded-sm text-[9px] font-bold tracking-widest uppercase ${result.status === 'extracted' ? 'bg-[var(--theme-accent)] text-[var(--bg-main)]' : 'bg-purple-500/20 text-purple-400 border border-purple-500/50'}`}>
+                             {result.status === 'extracted' ? 'EXACT MATCH FOUND' : 'AI GENERATED'}
+                         </span>
+                         <div className="flex gap-2">
+                             <button 
+                                 onClick={() => navigator.clipboard.writeText(result.prompt)}
+                                 className="text-[10px] text-[var(--text-secondary)] hover:text-[var(--theme-accent)] transition-colors flex items-center gap-1 bg-[var(--bg-button)] px-2 py-1 rounded-sm border border-[var(--border-focus)]"
+                             >
+                                 <Copy size={12} /> COPY PROMPT
+                             </button>
+                             <button 
+                                 onClick={() => navigator.clipboard.writeText(JSON.stringify(result, null, 2))}
+                                 className="text-[10px] text-[var(--text-secondary)] hover:text-[var(--theme-accent)] transition-colors flex items-center gap-1 bg-[var(--bg-button)] px-2 py-1 rounded-sm border border-[var(--border-focus)]"
+                             >
+                                 <FileJson size={12} /> COPY JSON
+                             </button>
+                         </div>
+                     </div>
+                     <div className="flex flex-col gap-4 overflow-y-auto mini-scrollbar pr-1 pb-4 text-xs font-mono">
+                        <div className="flex flex-col gap-1.5">
+                           <span className="text-[10px] text-[var(--theme-accent)] font-bold tracking-widest uppercase">Positive Prompt</span>
+                           <div className="bg-[var(--bg-main)] p-3 rounded-sm border border-[var(--border-color)] text-[var(--text-primary)] select-all whitespace-pre-wrap leading-relaxed">
+                              {result.prompt}
+                           </div>
+                        </div>
+                        {result.negative_prompt && (
+                          <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] text-[var(--text-muted)] font-bold tracking-widest uppercase">Negative Prompt</span>
+                             <div className="bg-[var(--bg-main)] p-3 rounded-sm border border-[var(--border-color)] text-[var(--text-muted)] select-all whitespace-pre-wrap leading-relaxed">
+                                {result.negative_prompt}
+                             </div>
+                          </div>
+                        )}
+                        {result.settings && Object.keys(result.settings).length > 0 && (
+                          <div className="flex flex-col gap-1.5">
+                             <span className="text-[10px] text-[var(--text-muted)] font-bold tracking-widest uppercase">Generation Settings</span>
+                             <div className="bg-[var(--bg-main)] p-3 rounded-sm border border-[var(--border-color)] grid grid-cols-2 sm:grid-cols-3 gap-3">
+                                {Object.entries(result.settings).map(([k, v]) => (
+                                   <div key={k} className="flex flex-col">
+                                      <span className="text-[9px] text-[var(--text-muted)] uppercase tracking-wider">{k.replace(/_/g, ' ')}</span>
+                                      <span className="text-[11px] text-[var(--text-secondary)] mt-0.5 truncate" title={String(v)}>{String(v)}</span>
+                                   </div>
+                                ))}
+                             </div>
+                          </div>
+                        )}
+                     </div>
+                 </div>
+             )}
+          </div>
+       </div>
+    </div>
+  );
+};
+
 
 export default function App() {
   const { t, lang, setLang } = useI18n();
@@ -1037,6 +1322,7 @@ export default function App() {
   const [denoiseLevel, setDenoiseLevel] = useState(1);
   const [denoiseRect, setDenoiseRect] = useState<{x: number, y: number, w: number, h: number} | null>(null);
   const [denoisePreviewItem, setDenoisePreviewItem] = useState<FileItem | null>(null);
+  const [promptExtractorItem, setPromptExtractorItem] = useState<FileItem | null>(null);
   const [targetColor, setTargetColor] = useState('#FFFFFF');
   const [colorTolerance, setColorTolerance] = useState(10);
   const [namingMode, setNamingMode] = useState<'original' | 'date_seq' | 'custom_seq'>('original');
@@ -1957,6 +2243,13 @@ export default function App() {
           />
       )}
       
+      {promptExtractorItem && (
+          <PromptExtractorModal
+             fileItem={promptExtractorItem}
+             onClose={() => setPromptExtractorItem(null)}
+          />
+      )}
+
       {denoisePreviewItem && (
           <DenoisePreviewModal
              fileItem={denoisePreviewItem}
@@ -2202,7 +2495,14 @@ export default function App() {
                              </div>
                           </div>
 
-                          <div className="flex items-center justify-end gap-3 w-20">
+                          <div className="flex items-center justify-end gap-3 w-auto flex-shrink-0">
+                             <button 
+                               onClick={(e) => { e.stopPropagation(); setPromptExtractorItem(fileItem); }}
+                               className="text-[var(--text-muted)] hover:text-[var(--theme-accent)] transition-colors"
+                               title="Extract Prompt"
+                             >
+                               <FileJson size={16} />
+                             </button>
                              {fileItem.status === 'done' && (
                                 <button 
                                   onClick={(e) => { e.stopPropagation(); resetFileState(fileItem.id); }}
